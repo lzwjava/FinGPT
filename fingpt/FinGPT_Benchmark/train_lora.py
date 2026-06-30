@@ -6,11 +6,11 @@ from functools import partial
 import datasets
 import torch
 from torch.utils.tensorboard import SummaryWriter
-import wandb
 from transformers import (
     AutoTokenizer,
     AutoModel,
     AutoModelForCausalLM,
+    BitsAndBytesConfig,
     TrainingArguments,
     Trainer,
     DataCollatorForSeq2Seq
@@ -23,15 +23,10 @@ from peft import (
     LoraConfig,
     get_peft_model,
     get_peft_model_state_dict,
-    prepare_model_for_int8_training,
+    prepare_model_for_kbit_training,
     set_peft_model_state_dict
 )
 from utils import *
-
-
-# Replace with your own api_key and project name
-os.environ['WANDB_API_KEY'] = 'ecf1e5e4f47441d46822d38a3249d62e8fc94db4'
-os.environ['WANDB_PROJECT'] = 'fingpt-benchmark'
 
 
 def main(args):
@@ -44,11 +39,17 @@ def main(args):
     # Parse the model name and determine if it should be fetched from a remote source
     model_name = parse_model_name(args.base_model, args.from_remote)
     
-    # Load the pre-trained causal language model
+    # 4-bit QLoRA config for single GPU (RTX 4070 12GB)
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16
+    )
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        # load_in_8bit=True,
-        # device_map="auto",
+        quantization_config=quantization_config,
+        device_map="auto",
         trust_remote_code=True
     )
     # Print model architecture for the first process in distributed training
@@ -65,9 +66,9 @@ def main(args):
         tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids('<|endoftext|>')
         tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids('<|extra_0|>')
     # Ensure padding token is set correctly
+    # Note: don't resize embeddings on quantized models — just use eos as pad
     if not tokenizer.pad_token or tokenizer.pad_token_id == tokenizer.eos_token_id:
-        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        model.resize_token_embeddings(len(tokenizer))
+        tokenizer.pad_token = tokenizer.eos_token
     
     # Load training and testing datasets
     dataset_list = load_dataset(args.dataset, args.from_remote)
@@ -109,22 +110,18 @@ def main(args):
         eval_steps=args.eval_steps,
         fp16=True,
         # fp16_full_eval=True,
-        deepspeed=args.ds_config,
         evaluation_strategy=args.evaluation_strategy,
         load_best_model_at_end=args.load_best_model,
         remove_unused_columns=False,
-        report_to='wandb',
-        run_name=args.run_name
+        report_to='none' if args.no_wandb else 'wandb',
+        run_name=args.run_name,
+        ddp_find_unused_parameters=False,
     )
     if not args.base_model == 'mpt':
         model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
-    model.is_parallelizable = True
-    model.model_parallel = True
-    model.config.use_cache = (
-        False
-    )
-    # model = prepare_model_for_int8_training(model
+    model.config.use_cache = False
+    model = prepare_model_for_kbit_training(model)
 
     # setup peft for lora
     peft_config = LoraConfig(
@@ -188,11 +185,10 @@ if __name__ == "__main__":
     parser.add_argument("--evaluation_strategy", default='steps', type=str)
     parser.add_argument("--load_best_model", default='False', type=bool)
     parser.add_argument("--eval_steps", default=0.1, type=float)    
-    parser.add_argument("--from_remote", default=False, type=bool)    
+    parser.add_argument("--from_remote", default=False, type=bool)
+    parser.add_argument("--no_wandb", action='store_true', help="Disable wandb logging")
+    parser.add_argument("--ds_config", type=str, help="DeepSpeed config (optional, single GPU doesn't need it)")
     args = parser.parse_args()
-
-    # Login to Weights and Biases
-    wandb.login()
 
     # Run the main function
     main(args)

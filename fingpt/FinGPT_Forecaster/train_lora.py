@@ -1,5 +1,5 @@
 from transformers.integrations import TensorBoardCallback
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, BitsAndBytesConfig
 from transformers import TrainingArguments, Trainer, DataCollatorForSeq2Seq
 from transformers import TrainerCallback, TrainerState, TrainerControl
 from transformers.trainer import TRAINING_ARGS_NAME
@@ -9,7 +9,6 @@ import torch
 import os
 import re
 import sys
-import wandb
 import argparse
 from datetime import datetime
 from functools import partial
@@ -22,13 +21,9 @@ from peft import (
     LoraConfig,
     get_peft_model,
     get_peft_model_state_dict,
-    prepare_model_for_int8_training,
-    set_peft_model_state_dict,   
+    prepare_model_for_kbit_training,
+    set_peft_model_state_dict,
 )
-
-# Replace with your own api_key and project name
-os.environ['WANDB_API_KEY'] = ''    # TODO: Replace with your environment variable
-os.environ['WANDB_PROJECT'] = 'fingpt-forecaster'
 
 
 class GenerationEvalCallback(TrainerCallback):
@@ -66,27 +61,26 @@ class GenerationEvalCallback(TrainerCallback):
                 generated_texts.append(answer)
                 reference_texts.append(gt)
 
-                # print("GENERATED: ", answer)
-                # print("REFERENCE: ", gt)
-
             metrics = calc_metrics(reference_texts, generated_texts)
-            
-            # Ensure wandb is initialized
-            if wandb.run is None:
-                wandb.init()
-                
-            wandb.log(metrics, step=state.global_step)
-            torch.cuda.empty_cache()            
+            print(f"Eval metrics at step {state.global_step}: {metrics}")
+            torch.cuda.empty_cache()
 
 
 def main(args):
         
     model_name = parse_model_name(args.base_model, args.from_remote)
     
-    # load model
+    # 4-bit QLoRA config for single GPU (RTX 4070 12GB)
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16
+    )
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        # load_in_8bit=True,
+        quantization_config=quantization_config,
+        device_map="auto",
         trust_remote_code=True
     )
     if args.local_rank == 0:
@@ -124,7 +118,7 @@ def main(args):
     formatted_time = current_time.strftime('%Y%m%d%H%M')
     
     training_args = TrainingArguments(
-        output_dir=f'finetuned_models/{args.run_name}_{formatted_time}', # 保存位置
+        output_dir=f'finetuned_models/{args.run_name}_{formatted_time}',
         logging_steps=args.log_interval,
         num_train_epochs=args.num_epochs,
         per_device_train_batch_size=args.batch_size,
@@ -138,20 +132,17 @@ def main(args):
         save_steps=args.eval_steps,
         eval_steps=args.eval_steps,
         fp16=True,
-        deepspeed=args.ds_config,
         evaluation_strategy=args.evaluation_strategy,
         remove_unused_columns=False,
-        report_to='wandb',
-        run_name=args.run_name
+        report_to='none' if args.no_wandb else 'wandb',
+        run_name=args.run_name,
+        ddp_find_unused_parameters=False,
     )
     
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
-    model.is_parallelizable = True
-    model.model_parallel = True
-    model.model.config.use_cache = False
-    
-    # model = prepare_model_for_int8_training(model)
+    model.config.use_cache = False
+    model = prepare_model_for_kbit_training(model)
 
     # setup peft
     peft_config = LoraConfig(
@@ -211,13 +202,13 @@ if __name__ == "__main__":
     parser.add_argument("--log_interval", default=20, type=int)
     parser.add_argument("--gradient_accumulation_steps", default=8, type=int)
     parser.add_argument("--warmup_ratio", default=0.05, type=float)
-    parser.add_argument("--ds_config", default='./config_new.json', type=str)
+    parser.add_argument("--ds_config", type=str, help="DeepSpeed config (optional, single GPU doesn't need it)")
     parser.add_argument("--scheduler", default='linear', type=str)
     parser.add_argument("--instruct_template", default='default')
     parser.add_argument("--evaluation_strategy", default='steps', type=str)    
     parser.add_argument("--eval_steps", default=0.1, type=float)    
     parser.add_argument("--from_remote", default=False, type=bool)    
+    parser.add_argument("--no_wandb", action='store_true', help="Disable wandb logging")
     args = parser.parse_args()
     
-    wandb.login()
     main(args)
